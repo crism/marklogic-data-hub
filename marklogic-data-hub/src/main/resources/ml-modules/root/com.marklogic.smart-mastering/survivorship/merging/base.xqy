@@ -190,61 +190,30 @@ declare function merge-impl:save-merge-models-by-uri(
     xdmp:log("Skipping merge because all uris to be merged (" || fn:string-join($uris, ", ") ||
       ") were already write-locked", "debug")
   else
+    let $start-elapsed := xdmp:elapsed-time()
     let $merge-options :=
       if ($merge-options instance of object-node()) then
         merge-impl:options-from-json($merge-options)
       else
         $merge-options
-    let $merged-uris := $uris[xdmp:document-get-collections(.) = $const:MERGED-COLL]
-    let $uris :=
-      for $uri in $uris
-      let $is-merged := $uri = $merged-uris
-      return
-        if ($is-merged) then
-          auditing:auditing-receipts-for-doc-uri($uri)
-            /auditing:previous-uri[. ne $uri] ! fn:string(.)
-        else
-          $uri
-    let $parsed-properties :=
-        merge-impl:parse-final-properties-for-merge(
-          $uris,
-          $merge-options
-        )
-    let $final-properties := map:get($parsed-properties, "final-properties")
-    let $merged-document :=
-      merge-impl:build-merge-models-by-final-properties(
-        $id,
-        map:get($parsed-properties, "documents"),
-        map:get($parsed-properties, "wrapper-qnames"),
-        $final-properties,
-        map:get($parsed-properties, "final-headers"),
-        map:get($parsed-properties, "final-triples"),
-        map:get($parsed-properties, $PROPKEY-HEADERS-NS-MAP),
-        $merge-options
-      )
-    let $merge-uri := merge-impl:build-merge-uri(
-      $id,
-      if ($merged-document instance of element() or
-        $merged-document instance of document-node(element())) then
-        $const:FORMAT-XML
-      else
-        $const:FORMAT-JSON
-    )
-    let $_audit-trail :=
-      auditing:audit-trace(
-        $const:MERGE-ACTION,
-        $uris,
-        $merge-uri,
-        merge-impl:generate-audit-attachments(
-          $merge-uri,
-          $final-properties
-        )
-      )
+    let $merge-write-object :=  merge-impl:build-merge-models-by-uri($uris, $merge-options, $id)
+    let $merged-document := $merge-write-object => map:get("value")
+    let $merge-uri := $merge-write-object => map:get("uri")
+    let $audit-trace := $merge-write-object => map:get("audit-trace")
     return (
       $merged-document,
+      xdmp:document-insert(
+        $audit-trace => map:get("uri"),
+        $audit-trace => map:get("value"),
+        (
+          xdmp:default-permissions()
+        ),
+        ($audit-trace => map:get("context"))
+          => map:get("collections")
+      ),
       let $on-merge-options := $merge-options/merging:algorithms/merging:collections/merging:on-merge
-      let $distinct-uris := fn:distinct-values(($uris, $merged-uris))[fn:doc-available(.)]
-      let $archive := $distinct-uris ! merge-impl:archive-document(., $merge-options)
+      let $distinct-uris := fn:distinct-values(($uris, $uris))[fn:doc-available(.)][fn:not(. = $merge-uri)]
+      let $_archive := $distinct-uris ! merge-impl:archive-document(., $merge-options)
       return
         xdmp:document-insert(
           $merge-uri,
@@ -257,8 +226,10 @@ declare function merge-impl:save-merge-models-by-uri(
             for $uri in $distinct-uris
             return map:entry($uri, xdmp:document-get-collections($uri)[fn:not(. = $const:ARCHIVED-COLL)])
           )),$on-merge-options)
-        )
-
+        ),
+        if (xdmp:trace-enabled($const:TRACE-PERFORMANCE)) then
+          xdmp:trace($const:TRACE-PERFORMANCE, "merge-impl:save-merge-models-by-uri: " || (xdmp:elapsed-time() - $start-elapsed))
+        else ()
     )
 };
 
@@ -368,13 +339,13 @@ declare function merge-impl:rollback-merge(
  : @param $block-future-merges   if true, then the future matches between documents
  :                               will be blocked; otherwise, the documents could match
  :                               on next process-match-and-merge
- : @return ()
+ : @return restored URIs
  :)
 declare function merge-impl:rollback-merge(
   $merged-doc-uri as xs:string,
   $retain-rollback-info as xs:boolean,
   $block-future-merges as xs:boolean
-) as empty-sequence()
+) as xs:string*
 {
   let $latest-auditing-receipt-for-doc :=
     fn:head(
@@ -382,45 +353,37 @@ declare function merge-impl:rollback-merge(
       order by $auditing-doc//prov:time ! xs:dateTime(.) descending
       return $auditing-doc
     )
-  let $previous-uris := $latest-auditing-receipt-for-doc//*:previous-uri[. ne $merged-doc-uri] ! fn:string(.)
   let $merge-doc-headers := fn:doc($merged-doc-uri)/*:envelope/*:headers
-  let $all-contributing-uris := $merge-doc-headers/*:merges/*:document-uri ! fn:string(.)
+  let $merge-options-ref := $merge-doc-headers/*:merge-options/*:value ! fn:string(.)
+  let $castable-as-hex := $merge-options-ref castable as xs:hexBinary
+  let $merge-options :=
+            if ($castable-as-hex) then
+              xdmp:zip-get(binary { $merge-options-ref }, "merge-options.xml")/*
+            else
+              fn:doc($merge-options-ref)/*
+  let $all-contributing-uris := $merge-doc-headers/*:merges/*:document-uri
+  let $last-merge-dateTime := fn:max($all-contributing-uris/(@last-merge|../last-merge) ! xs:dateTime(.))
+  let $previous-uris := if (fn:empty($last-merge-dateTime) and fn:exists($latest-auditing-receipt-for-doc)) then
+      $latest-auditing-receipt-for-doc/auditing:previous-uri ! fn:string(.)
+    else
+      $all-contributing-uris[(@last-merge|../last-merge) = $last-merge-dateTime] ! fn:string(.)
   where fn:exists($latest-auditing-receipt-for-doc)
   return (
     let $prevent-auto-match :=
       if ($block-future-merges) then
         matcher:block-matches($previous-uris)
       else ()
+    let $on-merge-options := $merge-options/merging:algorithms/merging:collections/merging:on-merge
     for $previous-doc-uri in $previous-uris
-    let $new-collections := (
-      xdmp:document-get-collections($previous-doc-uri)[fn:not(. = $const:ARCHIVED-COLL)],
-      $const:CONTENT-COLL
-    )
+    let $new-collections := coll-impl:on-merge(
+            map:entry($previous-doc-uri, xdmp:document-get-collections($previous-doc-uri)[fn:not(. = $const:ARCHIVED-COLL)])
+          ,$on-merge-options)
     where fn:not(merge-impl:source-of-other-merged-doc($previous-doc-uri, $merged-doc-uri))
     return (
       xdmp:document-set-collections($previous-doc-uri, $new-collections)
     ),
-    if ((some $uri in $all-contributing-uris satisfies fn:not($uri = $previous-uris))) then
-      let $merge-options-ref := $merge-doc-headers/*:merge-options/*:value ! fn:string(.)
-      let $castable-as-hex := $merge-options-ref castable as xs:hexBinary
-      let $doc-available := fn:doc-available($merge-options-ref)
-      where $castable-as-hex or $doc-available
-      return
-        merge-impl:save-merge-models-by-uri(
-          $all-contributing-uris[fn:not(. = $previous-uris)],
-          if ($castable-as-hex) then
-            xdmp:zip-get(binary { $merge-options-ref }, "merge-options.xml")/*
-          else
-            fn:doc($merge-options-ref)/*
-        )
-    else (),
     if ($retain-rollback-info) then (
-      xdmp:document-set-collections($merged-doc-uri,
-        (
-          xdmp:document-get-collections($merged-doc-uri)[fn:not(. = $const:CONTENT-COLL)],
-          $const:ARCHIVED-COLL
-        )
-      ),
+      merge-impl:archive-document($merged-doc-uri, $merge-options),
       $latest-auditing-receipt-for-doc ! auditing:audit-trace-rollback(.)
     ) else (
       xdmp:document-delete($merged-doc-uri),
@@ -479,6 +442,7 @@ declare function merge-impl:build-merge-models-by-uri(
   $id as xs:string
 )
 {
+  let $start-elapsed := xdmp:elapsed-time()
   let $expanded-uris :=
     fn:distinct-values(
       for $uri in $uris
@@ -509,8 +473,9 @@ declare function merge-impl:build-merge-models-by-uri(
                 else
                   $const:FORMAT-JSON
   let $merge-uri := merge-impl:build-merge-uri($id, $format)
-  return
+  return (
     map:map()
+      => map:with("uri", $merge-uri)
       => map:with("audit-trace",
           auditing:build-audit-trace(
             $const:MERGE-ACTION,
@@ -525,6 +490,7 @@ declare function merge-impl:build-merge-models-by-uri(
       => map:with("value",
           merge-impl:build-merge-models-by-final-properties(
             $id,
+            $uris,
             $docs,
             $wrapper-qnames,
             $final-properties,
@@ -533,7 +499,11 @@ declare function merge-impl:build-merge-models-by-uri(
             $headers-ns-map,
             $merge-options
           )
-        )
+        ),
+        if (xdmp:trace-enabled($const:TRACE-PERFORMANCE)) then
+          xdmp:trace($const:TRACE-PERFORMANCE, "merge-impl:build-merge-models-by-uri: " || (xdmp:elapsed-time() - $start-elapsed))
+        else ()
+    )
 };
 
 (:
@@ -547,6 +517,7 @@ declare function merge-impl:build-merge-models-by-uri(
  :)
 declare function merge-impl:build-merge-models-by-final-properties(
   $id as xs:string,
+  $uris as xs:string*,
   $docs as node()*,
   $wrapper-qnames as xs:QName*,
   $final-properties as item()*,
@@ -559,6 +530,7 @@ declare function merge-impl:build-merge-models-by-final-properties(
   if ($docs instance of document-node(element())+) then
     merge-impl:build-merge-models-by-final-properties-to-xml(
       $id,
+      $uris,
       $docs,
       $wrapper-qnames,
       $final-properties,
@@ -570,6 +542,7 @@ declare function merge-impl:build-merge-models-by-final-properties(
   else
     merge-impl:build-merge-models-by-final-properties-to-json(
       $id,
+      $uris,
       $docs,
       $wrapper-qnames,
       $final-properties,
@@ -592,6 +565,7 @@ declare function merge-impl:build-merge-models-by-final-properties(
  :)
 declare function merge-impl:build-merge-models-by-final-properties-to-xml(
   $id as xs:string,
+  $uris as xs:string*,
   $docs as node()*,
   $wrapper-qnames as xs:QName*,
   $final-properties as item()*,
@@ -601,8 +575,6 @@ declare function merge-impl:build-merge-models-by-final-properties-to-xml(
   $merge-options as element()?
 ) as element(es:envelope)
 {
-  let $uris := $docs ! xdmp:node-uri(.)
-  return
     <es:envelope>
       {
         merge-impl:build-headers($id, $docs, $uris, $final-headers, $headers-ns-map, $merge-options, $const:FORMAT-XML)
@@ -611,6 +583,7 @@ declare function merge-impl:build-merge-models-by-final-properties-to-xml(
         $final-triples
       }</es:triples>
       <es:instance>{
+        fn:head($docs)/es:envelope/es:instance/es:info,
         merge-impl:build-instance-body-by-final-properties(
           $final-properties,
           $wrapper-qnames,
@@ -648,8 +621,12 @@ declare function merge-impl:build-headers(
   if ($format = ($const:FORMAT-XML, $const:FORMAT-JSON)) then
     ()
   else fn:error(xs:QName("SM-INVALID-FORMAT"), "merge-impl:build-headers called with invalid format " || $format),
-
-
+  let $current-dateTime := fn:current-dateTime()
+  let $all-uris :=
+      for $uri in fn:distinct-values(($docs ! xdmp:node-uri(.), $uris))
+      order by $uri
+      return $uri
+  let $all-merged-docs := $all-uris[fn:starts-with(., $MERGED-DIR)] ! fn:doc(.)
   let $is-xml := $format = $const:FORMAT-XML
   (: remove "/*:envelope/*:headers" from the paths; already accounted for :)
   let $configured-paths := $final-headers ! map:get(., "path") ! fn:replace(., "/.*headers(/.*)", "$1")
@@ -696,8 +673,17 @@ declare function merge-impl:build-headers(
       <es:headers>
         <sm:id>{$id}</sm:id>
         <sm:merges>{
-          $docs/es:envelope/es:headers/sm:merges/sm:document-uri,
-          $uris ! element sm:document-uri { . }
+          for $uri in $all-uris
+          return
+            element sm:document-uri {
+              attribute last-merge {
+                if ($uri = $uris) then
+                  $current-dateTime
+                else
+                  fn:max($all-merged-docs/es:envelope/es:headers/sm:merges/sm:document-uri[. eq $uri]/@last-merge ! xs:dateTime(.))
+              },
+              $uri
+            }
         }</sm:merges>
         <sm:sources>{
           merge-impl:distinct-node-values($docs/es:envelope/es:headers/sm:sources/sm:source)
@@ -724,8 +710,14 @@ declare function merge-impl:build-headers(
         map:new((
           map:entry("id", $id),
           map:entry("merges", array-node {
-            $docs/envelope/headers/merges/object-node(),
-            $uris ! object-node { "document-uri": . }
+            for $uri in $all-uris
+            return
+              object-node { "document-uri": $uri, "last-merge":
+                if ($uri = $uris) then
+                  $current-dateTime
+                else
+                  fn:max($all-merged-docs/envelope/headers/merges/document-uri[. eq $uri]/../last-merge ! xs:dateTime(.))
+              }
           }),
           map:entry("sources", array-node {
             merge-impl:distinct-node-values($docs/envelope/headers/sources)
@@ -998,6 +990,7 @@ declare function merge-impl:map-to-json($m as map:map)
  :)
 declare function merge-impl:build-merge-models-by-final-properties-to-json(
   $id as xs:string,
+  $uris as xs:string*,
   $docs as node()*,
   $wrapper-qnames as xs:QName*,
   $final-properties as item()*,
@@ -1006,18 +999,27 @@ declare function merge-impl:build-merge-models-by-final-properties-to-json(
   $merge-options as element()?
 )
 {
-  let $uris := $docs ! xdmp:node-uri(.)
-  return
     object-node {
       "envelope": object-node {
         "headers": merge-impl:build-headers($id, $docs, $uris, $final-headers, (), $merge-options, $const:FORMAT-JSON),
         "triples": array-node {
           $final-triples
         },
-        "instance": merge-impl:build-instance-body-by-final-properties(
-          $final-properties,
-          $wrapper-qnames,
-          $const:FORMAT-JSON
+        "instance": (
+          let $instance-body :=
+            merge-impl:build-instance-body-by-final-properties(
+              $final-properties,
+              $wrapper-qnames,
+              $const:FORMAT-JSON
+            )
+          let $info := fn:head($docs)/envelope/instance/info
+          return
+            if (fn:exists($info)) then
+              object-node{
+                "info": $info
+              } + $instance-body
+            else
+              $instance-body
         )
       }
     }
@@ -1264,7 +1266,7 @@ declare function merge-impl:get-sources(
   for $doc in $docs
   let $sources := $doc/(es:envelope|object-node("envelope"))
       /(es:headers|object-node("headers"))
-      /(*:sources/(*:source|*:name)|array-node("sources")/object-node("sources")|object-node("sources"))
+      /(*:sources/(*:source|*:name)[self::element()]|array-node("sources")/object-node("sources")|object-node("sources"))
   let $sources := if (fn:empty($sources)) then object-node { "name": xdmp:node-uri($doc) } else $sources
   for $source in $sources
   let $last-updated :=
@@ -1713,13 +1715,18 @@ declare function merge-impl:build-final-properties(
   $target-entity
 ) as map:map*
 {
+  let $sources-by-document-uri :=
+    map:new(
+      for $doc-uri in $sources/documentUri
+      return map:entry($doc-uri, $doc-uri/..)
+    )
   let $entity-definition := es-helper:get-entity-def($target-entity)
   let $entity-def-namespace := $entity-definition/namespaceUri
   let $top-level-properties :=
     if (fn:exists($entity-definition)) then
       for $prop in $entity-definition/properties
       return
-        fn:QName($entity-def-namespace, xdmp:encode-for-NCName($prop/title))
+        fn:QName($entity-def-namespace, merge-impl:NCName-compatible($prop/title))
     else
       fn:distinct-values($instances/* ! fn:node-name(.))
   let $property-defs := $merge-options/merging:property-defs[fn:exists(merging:property/@localname)]
@@ -1776,7 +1783,7 @@ declare function merge-impl:build-final-properties(
             $source-details/sourceLocation
           else:)
         merge-impl:node-uri($doc)
-      let $prop-sources := $sources[documentUri = $lineage-uris]
+      let $prop-sources := $lineage-uris ! map:get($sources-by-document-uri, .)
       where fn:exists($props-for-instance)
       return
         merge-impl:wrap-revision-info($prop-qname, $prop-value, $prop-sources, $path-prop/@path, $ns-map)
@@ -1803,7 +1810,7 @@ declare function merge-impl:build-final-properties(
       if (xdmp:trace-enabled($const:TRACE-MERGE-RESULTS)) then
         xdmp:trace($const:TRACE-MERGE-RESULTS, xdmp:describe(('Processing top level property',$prop),(),()))
       else ()
-    let $property-title := xdmp:decode-from-NCName(fn:local-name-from-QName($prop))
+    let $property-title := merge-impl:NCName-compatible-reverse(fn:local-name-from-QName($prop))
     let $property-details := es-helper:get-entity-def-property($entity-definition, $property-title)
     let $prop-entity-ref := fn:head($property-details/(itemsRef|ref)[. ne ''])
     let $instance-props :=
@@ -1819,7 +1826,7 @@ declare function merge-impl:build-final-properties(
       if (fn:exists($prop-entity-ref) and fn:empty($merge-spec[fn:ends-with(@property-name, $property-title)])) then
         let $prop-entity-def := es-helper:get-entity-def($prop-entity-ref)
         let $prop-entity-title := $prop-entity-def/entityTitle
-        let $prop-entity-local-name := xdmp:encode-for-NCName($prop-entity-title)
+        let $prop-entity-local-name := merge-impl:NCName-compatible($prop-entity-title)
         let $prop-entity-instances :=
           if ($is-json) then
             for $instance-prop in $instance-props/*[fn:string(fn:node-name(.)) eq $prop-entity-local-name]
@@ -1848,7 +1855,7 @@ declare function merge-impl:build-final-properties(
         let $prop-entity-primary-key := $prop-entity-def/primaryKey[fn:string(.) ne '']
         let $primary-key-local-name :=
               if (fn:exists($prop-entity-primary-key)) then
-                xdmp:encode-for-NCName($prop-entity-primary-key)
+                merge-impl:NCName-compatible($prop-entity-primary-key)
               else ()
         let $distinct-primary-key-values :=
               if (fn:exists($prop-entity-primary-key)) then
@@ -1960,7 +1967,7 @@ declare function merge-impl:build-final-properties(
                 $source-details/sourceLocation
               else:)
             merge-impl:node-uri($doc)
-          let $prop-sources := $sources[documentUri = $lineage-uris]
+          let $prop-sources := $lineage-uris ! map:get($sources-by-document-uri, .)
           let $_trace :=
             if (xdmp:trace-enabled($const:TRACE-MERGE-RESULTS)) then
               xdmp:trace($const:TRACE-MERGE-RESULTS, xdmp:describe(('Doc', $doc , 'Properties for doc', $props-for-instance),(),()))
@@ -2337,8 +2344,9 @@ declare function merge-impl:options-to-json($options-xml as element(merging:opti
                     "collections",
                     map:new(
                       for $event in $options-xml/merging:algorithms/merging:collections/*
+                      let $json := merge-impl:collection-event-to-json($event)
                       return
-                        merge-impl:collection-event-to-json($event)
+                        map:entry(fn:string(fn:node-name($json)), $json)
                     )
                   )
                 else ()
@@ -2536,7 +2544,7 @@ declare private function merge-impl:construct-merging-element($options-json as o
       => map:with("camel-case", fn:true())
       => map:with("whitespace", "ignore")
       => map:with("array-element-names", $array-element-names)
-      => map:with("attribute-names", ("name", "weight", "strategy", "propertyName", "algorithmRef", "maxValues", "maxSources", "documentUri"))
+      => map:with("attribute-names", ("default", "name", "weight", "strategy", "propertyName", "algorithmRef", "maxValues", "maxSources", "documentUri"))
     let $all-xml := (
       for $merge in $options-json/*:options/*:merging
       return
@@ -2693,4 +2701,26 @@ declare function merge-impl:propertyspec-to-json($property-spec as element()) as
     => map:with("ignore-element-names", xs:QName("merging:merge"))
   return
     json:transform-to-json($transformed-xml, $config)/*
+};
+
+declare function merge-impl:NCName-compatible($value as xs:string)
+{
+  if ($value castable as xs:NCName) then
+    $value
+  else
+    xdmp:encode-for-NCName($value)
+};
+
+declare variable $_to-decoded-NCName as map:map := map:map();
+
+declare function merge-impl:NCName-compatible-reverse($value as xs:string)
+{
+  if (map:contains($_to-decoded-NCName, $value)) then
+    map:get($_to-decoded-NCName, $value)
+  else
+    let $decoded-value := fn:head((try {xdmp:decode-from-NCName($value)} catch * {()}, $value))
+    return (
+      map:put($_to-decoded-NCName, $value, $decoded-value),
+      $decoded-value
+    )
 };
